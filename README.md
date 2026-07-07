@@ -10,7 +10,7 @@ Scans Twitch VODs for mentions of specific product names using Whisper transcrip
 4. Fuzzy-matches the transcript against target product names
 5. Outputs a JSON file with timestamps and 30-second context windows around each mention
 
-Keywords scanned for: product names (`flick fire`, `flick edge`, `flick stratus`, `npen`), mousepad/mouse references (`new mousepad`, `new mouse`, `mouse glide`, `good glide`, `nice glide`, `glides smooth`), and aim/feel phrases (`feels smooth`, `so smooth`, `smooth aim`, `aim feels`, `tracking feels`, `control feels`)
+Keywords, streamers, and scan history are managed in `config.json` (see [Configuration](#configuration) below).
 
 ## Setup
 
@@ -36,17 +36,81 @@ TWITCH_CLIENT_SECRET=your_client_secret_here
 
 Alternatively, set them directly as environment variables.
 
+## Configuration
+
+`config.json` sits alongside the script and controls everything:
+
+```json
+{
+  "discord_webhook_url": "https://discordapp.com/api/webhooks/...",
+  "streamers": ["shroud", "xqc"],
+  "keywords": ["flick fire", "flick edge", "new mousepad"],
+  "fuzzy_threshold": 80,
+  "processed_vods": {}
+}
+```
+
+- **`discord_webhook_url`** — Discord webhook to notify when a mention is found. Remove the key entirely to disable notifications.
+- **`streamers`** — Twitch usernames scanned when no username is passed on the CLI
+- **`keywords`** — product names and phrases to match against transcripts
+- **`fuzzy_threshold`** — default match score (0–100); overridden by `--threshold`
+- **`processed_vods`** — populated automatically after each scan; VODs listed here are skipped on future runs to avoid re-processing. Remove an entry by hand to force a re-scan.
+
+## Testing Discord notifications
+
+The quickest way to confirm notifications are working is to scan a VOD you already know contains a keyword match, using a low threshold so something is guaranteed to fire.
+
+**1. Find a VOD ID that will produce a hit**
+
+Pick a VOD from a streamer you know has mentioned one of your keywords. Copy the VOD ID from the URL — e.g. `https://www.twitch.tv/videos/2803949530` → `2803949530`.
+
+**2. Make sure the VOD isn't in `processed_vods` yet**
+
+If it is, remove its entry from `config.json` so the script doesn't skip it:
+
+```json
+"processed_vods": {}
+```
+
+**3. Run with a low threshold to force matches**
+
+```bash
+python clip_scanner.py --vod-id 2803949530 --threshold 50
+```
+
+Dropping the threshold to `50` makes fuzzy matching much more permissive, so you're likely to get at least one hit even on a VOD that doesn't contain an exact keyword match. If you get a hit, a Discord embed will be posted immediately.
+
+**4. What the notification looks like**
+
+Each mention produces one embed:
+
+- **Title**: `Product mention: flick fire` — links directly to the VOD at the exact timestamp
+- **Streamer / Timestamp / Match** fields inline
+- **Quote**: the ~30-second transcript window surrounding the mention
+
+**Troubleshooting**
+
+| Symptom | Fix |
+|---|---|
+| No notification, no error | No mentions found at the current threshold — lower `--threshold` |
+| `Discord notification failed: 404` | Webhook URL is invalid or has been deleted — regenerate in Discord server settings |
+| `Discord notification failed: 429` | Rate limited; Discord allows ~30 requests/minute per webhook. Unlikely unless a single VOD has dozens of hits. |
+| Notification fires but VOD link doesn't jump to timestamp | The `?t=` param only works when you're logged in to Twitch |
+
 ## Usage
 
 ```bash
-# Scan the 5 most recent VODs (default)
+# Scan all streamers listed in config.json (5 most recent VODs each)
+python clip_scanner.py
+
+# Scan a specific streamer
 python clip_scanner.py shroud
 
 # Scan 20 VODs with a more accurate Whisper model
 python clip_scanner.py shroud --vods 20 --model small
 
 # Scan a specific VOD by ID
-python clip_scanner.py shroud --vod-id 2803949530
+python clip_scanner.py --vod-id 2803949530
 
 # Custom output path, lower match threshold, keep audio files
 python clip_scanner.py xqc --vods 10 --output results/xqc.json --threshold 75 --keep-audio
@@ -56,12 +120,12 @@ python clip_scanner.py xqc --vods 10 --output results/xqc.json --threshold 75 --
 
 | Flag | Default | Description |
 |---|---|---|
-| `username` | *(required)* | Twitch username to scan |
+| `username` | *(optional)* | Twitch username to scan; omit to scan all streamers in `config.json` |
 | `--vod-id VOD_ID` | — | Scan a specific VOD ID (skips recent VOD fetch) |
-| `--vods N` | `5` | Number of most recent VODs to scan |
+| `--vods N` | `5` | Number of most recent VODs to scan per streamer |
 | `--model` | `base` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large` |
 | `--output PATH` | `mentions.json` | Output JSON file path |
-| `--threshold 0-100` | `80` | Fuzzy match score threshold |
+| `--threshold 0-100` | from config | Fuzzy match score threshold |
 | `--keep-audio` | off | Keep downloaded MP3s in `./audio/` |
 
 **Choosing a Whisper model:**

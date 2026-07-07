@@ -6,6 +6,8 @@ import sys
 import json
 import tempfile
 import argparse
+import time
+import datetime
 import subprocess
 from pathlib import Path
 
@@ -19,30 +21,22 @@ load_dotenv()
 TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID")
 TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET")
 
-KEYWORDS = [
-    # Specific products
-    "flick fire",
-    "flick edge",
-    "flick stratus",
-    "npen",
-    # Mousepad / mouse references
-    "new mousepad",
-    "new mouse",
-    "mouse glide",
-    "good glide",
-    "nice glide",
-    "glides smooth",
-    # Aim / feel phrases
-    "feels smooth",
-    "so smooth",
-    "smooth aim",
-    "aim feels",
-    "tracking feels",
-    "control feels",
-]
-
 FUZZY_THRESHOLD = 80
 WINDOW_SECONDS = 30
+
+CONFIG_PATH = Path(__file__).parent / "config.json"
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        return {"streamers": [], "keywords": [], "fuzzy_threshold": FUZZY_THRESHOLD, "processed_vods": {}}
+    return json.loads(CONFIG_PATH.read_text())
+
+
+def save_config(config):
+    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+
+
 DEDUP_WINDOW_SECONDS = 5
 
 
@@ -162,12 +156,12 @@ def format_timestamp(seconds):
     return f"{minutes:02d}:{secs:02d}"
 
 
-def find_mentions(words, threshold):
+def find_mentions(words, keywords, threshold):
     raw = []
     n = len(words)
 
     for i in range(n):
-        for product in KEYWORDS:
+        for product in keywords:
             product_parts = product.split()
             span = len(product_parts)
             if i + span > n:
@@ -206,14 +200,51 @@ def extract_window(words, timestamp_seconds, window_seconds=WINDOW_SECONDS):
     return " ".join(window_words)
 
 
+def format_vod_url(vod_id, seconds):
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    t = f"{hours}h{minutes}m{secs}s" if hours else f"{minutes}m{secs}s"
+    return f"https://www.twitch.tv/videos/{vod_id}?t={t}"
+
+
+def post_discord_notification(webhook_url, streamer, vod_id, vod_title, mention, context):
+    vod_url = format_vod_url(vod_id, mention["timestamp_seconds"])
+    payload = {
+        "embeds": [{
+            "title": f"Product mention: {mention['product']}",
+            "url": vod_url,
+            "description": f'"{context}"',
+            "color": 0x9146FF,
+            "fields": [
+                {"name": "Streamer", "value": streamer or "unknown", "inline": True},
+                {"name": "Timestamp", "value": f"[{mention['timestamp_formatted']}]({vod_url})", "inline": True},
+                {"name": "Match", "value": f"`{mention['matched_text']}` ({mention['fuzzy_score']}%)", "inline": True},
+                {"name": "VOD", "value": f"[{vod_title}]({vod_url})", "inline": False},
+            ],
+        }]
+    }
+    while True:
+        resp = requests.post(webhook_url, json=payload)
+        if resp.status_code == 429:
+            retry_after = resp.json().get("retry_after", 1)
+            time.sleep(retry_after)
+            continue
+        resp.raise_for_status()
+        break
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Scan Twitch VODs for product mentions using Whisper + fuzzy matching."
     )
-    parser.add_argument("username", help="Twitch username to scan")
+    parser.add_argument(
+        "username", nargs="?",
+        help="Twitch username to scan (omit to scan all streamers in config.json)",
+    )
     parser.add_argument(
         "--vods", type=int, default=5, metavar="N",
-        help="Number of recent VODs to scan (default: 5)",
+        help="Number of recent VODs to scan per streamer (default: 5)",
     )
     parser.add_argument(
         "--model",
@@ -226,8 +257,8 @@ def main():
         help="Output JSON file path (default: mentions.json)",
     )
     parser.add_argument(
-        "--threshold", type=int, default=FUZZY_THRESHOLD, metavar="0-100",
-        help=f"Fuzzy match threshold (default: {FUZZY_THRESHOLD})",
+        "--threshold", type=int, default=None, metavar="0-100",
+        help="Fuzzy match threshold (default: fuzzy_threshold in config.json)",
     )
     parser.add_argument(
         "--vod-id", metavar="VOD_ID",
@@ -246,81 +277,129 @@ def main():
         )
         sys.exit(1)
 
-    print(f"Authenticating with Twitch...")
-    token = get_twitch_token()
+    config = load_config()
+    keywords = config.get("keywords", [])
+    threshold = args.threshold if args.threshold is not None else config.get("fuzzy_threshold", FUZZY_THRESHOLD)
+    processed_vods = config.get("processed_vods", {})
+    discord_webhook_url = config.get("discord_webhook_url")
+
+    if not keywords:
+        print("Warning: no keywords configured in config.json.", file=sys.stderr)
 
     if args.vod_id:
-        print(f"Fetching metadata for VOD {args.vod_id}...")
-        vods = get_vod_by_id(token, args.vod_id)
+        usernames_to_scan = [None]
+    elif args.username:
+        usernames_to_scan = [args.username]
     else:
-        print(f"Looking up Twitch user: {args.username}")
-        user_id = get_user_id(token, args.username)
-        print(f"Fetching {args.vods} most recent VOD(s)...")
-        vods = get_vods(token, user_id, limit=args.vods)
+        usernames_to_scan = config.get("streamers", [])
+        if not usernames_to_scan:
+            print(
+                "Error: no username given and no streamers configured in config.json.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
-    if not vods:
-        print("No VODs found.")
-        sys.exit(0)
-    print(f"Found {len(vods)} VOD(s).")
+    print("Authenticating with Twitch...")
+    token = get_twitch_token()
 
     print(f"Loading Whisper model '{args.model}'...")
     whisper_model = whisper.load_model(args.model)
 
     all_results = []
+    total_vods_scanned = 0
 
     audio_dir_ctx = (
         _keep_audio_dir() if args.keep_audio else tempfile.TemporaryDirectory()
     )
 
     with audio_dir_ctx as audio_dir:
-        for idx, vod in enumerate(vods, 1):
-            vod_id = vod["id"]
-            vod_title = vod["title"]
-            created_at = vod["created_at"]
-            print(f"\n[{idx}/{len(vods)}] {vod_title}")
-            print(f"  VOD ID: {vod_id}  |  Created: {created_at}")
+        for username in usernames_to_scan:
+            if args.vod_id:
+                print(f"\nFetching metadata for VOD {args.vod_id}...")
+                vods = get_vod_by_id(token, args.vod_id)
+            else:
+                print(f"\nLooking up Twitch user: {username}")
+                user_id = get_user_id(token, username)
+                print(f"Fetching {args.vods} most recent VOD(s)...")
+                vods = get_vods(token, user_id, limit=args.vods)
 
-            try:
-                print("  Downloading audio...")
-                audio_path = download_audio(vod_id, audio_dir)
-
-                print("  Transcribing with Whisper (this may take a while)...")
-                words = transcribe_audio(audio_path, whisper_model)
-                print(f"  Transcribed {len(words)} words.")
-
-                print("  Searching for product mentions...")
-                mentions = find_mentions(words, threshold=args.threshold)
-
-                if mentions:
-                    print(f"  Found {len(mentions)} mention(s).")
-                    for mention in mentions:
-                        context = extract_window(words, mention["timestamp_seconds"])
-                        all_results.append({
-                            "vod_id": vod_id,
-                            "vod_title": vod_title,
-                            "vod_created_at": created_at,
-                            "timestamp_seconds": round(mention["timestamp_seconds"], 2),
-                            "timestamp_formatted": mention["timestamp_formatted"],
-                            "keyword_matched": mention["product"],
-                            "matched_text": mention["matched_text"],
-                            "fuzzy_score": mention["fuzzy_score"],
-                            "context_window": context,
-                        })
-                else:
-                    print("  No mentions found.")
-
-                if not args.keep_audio:
-                    audio_path.unlink(missing_ok=True)
-
-            except Exception as exc:
-                print(f"  Error: {exc}", file=sys.stderr)
+            if not vods:
+                print(f"  No VODs found.")
                 continue
+
+            unprocessed = [v for v in vods if v["id"] not in processed_vods]
+            skipped = len(vods) - len(unprocessed)
+            if skipped:
+                print(f"  Skipping {skipped} already-processed VOD(s).")
+            if not unprocessed:
+                print("  All VODs already processed.")
+                continue
+            print(f"  {len(unprocessed)} VOD(s) to scan.")
+
+            for idx, vod in enumerate(unprocessed, 1):
+                vod_id = vod["id"]
+                vod_title = vod["title"]
+                created_at = vod["created_at"]
+                print(f"\n  [{idx}/{len(unprocessed)}] {vod_title}")
+                print(f"    VOD ID: {vod_id}  |  Created: {created_at}")
+
+                try:
+                    print("    Downloading audio...")
+                    audio_path = download_audio(vod_id, audio_dir)
+
+                    print("    Transcribing with Whisper (this may take a while)...")
+                    words = transcribe_audio(audio_path, whisper_model)
+                    print(f"    Transcribed {len(words)} words.")
+
+                    print("    Searching for product mentions...")
+                    mentions = find_mentions(words, keywords, threshold=threshold)
+
+                    if mentions:
+                        print(f"    Found {len(mentions)} mention(s).")
+                        for mention in mentions:
+                            context = extract_window(words, mention["timestamp_seconds"])
+                            all_results.append({
+                                "vod_id": vod_id,
+                                "vod_title": vod_title,
+                                "vod_created_at": created_at,
+                                "timestamp_seconds": round(mention["timestamp_seconds"], 2),
+                                "timestamp_formatted": mention["timestamp_formatted"],
+                                "keyword_matched": mention["product"],
+                                "matched_text": mention["matched_text"],
+                                "fuzzy_score": mention["fuzzy_score"],
+                                "context_window": context,
+                            })
+                            if discord_webhook_url:
+                                try:
+                                    post_discord_notification(
+                                        discord_webhook_url, username, vod_id, vod_title, mention, context
+                                    )
+                                except Exception as exc:
+                                    print(f"    Discord notification failed: {exc}", file=sys.stderr)
+                    else:
+                        print("    No mentions found.")
+
+                    processed_vods[vod_id] = {
+                        "streamer": username,
+                        "title": vod_title,
+                        "processed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    }
+                    config["processed_vods"] = processed_vods
+                    save_config(config)
+                    total_vods_scanned += 1
+
+                    if not args.keep_audio:
+                        audio_path.unlink(missing_ok=True)
+
+                except Exception as exc:
+                    print(f"    Error: {exc}", file=sys.stderr)
+                    continue
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(all_results, indent=2))
 
-    print(f"\nDone. {len(all_results)} mention(s) found across {len(vods)} VOD(s).")
+    print(f"\nDone. {len(all_results)} mention(s) found across {total_vods_scanned} VOD(s).")
     print(f"Results saved to: {output_path}")
 
 
