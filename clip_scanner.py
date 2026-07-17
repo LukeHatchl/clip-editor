@@ -340,6 +340,7 @@ def main():
                 vod_id = vod["id"]
                 vod_title = vod["title"]
                 created_at = vod["created_at"]
+                streamer_name = username or vod.get("user_login") or vod.get("user_name") or "unknown"
                 print(f"\n  [{idx}/{len(unprocessed)}] {vod_title}")
                 print(f"    VOD ID: {vod_id}  |  Created: {created_at}")
 
@@ -372,7 +373,7 @@ def main():
                             if discord_webhook_url:
                                 try:
                                     post_discord_notification(
-                                        discord_webhook_url, username, vod_id, vod_title, mention, context
+                                        discord_webhook_url, streamer_name, vod_id, vod_title, mention, context
                                     )
                                 except Exception as exc:
                                     print(f"    Discord notification failed: {exc}", file=sys.stderr)
@@ -380,7 +381,7 @@ def main():
                         print("    No mentions found.")
 
                     processed_vods[vod_id] = {
-                        "streamer": username,
+                        "streamer": streamer_name,
                         "title": vod_title,
                         "processed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     }
