@@ -114,7 +114,33 @@ python clip_scanner.py --vod-id 2803949530
 
 # Custom output path, lower match threshold, keep audio files
 python clip_scanner.py xqc --vods 10 --output results/xqc.json --threshold 75 --keep-audio
+
+# Run continuously, rescanning all configured streamers every 24 hours (default)
+python clip_scanner.py --schedule
+
+# Run continuously on a custom interval, e.g. every 30 minutes
+python clip_scanner.py --schedule 0.5
 ```
+
+## Scheduling
+
+Pass `--schedule` to keep the script running and rescan the streamers in `config.json` on a loop instead of exiting after one pass:
+
+```bash
+# Every 24 hours (the default)
+python clip_scanner.py --schedule
+
+# Every 0.5 hours (30 minutes)
+python clip_scanner.py --schedule 0.5
+```
+
+Notes:
+- The interval is in hours and accepts decimals (`--schedule 0.5` = 30 minutes, `--schedule 2` = 2 hours).
+- Each cycle re-reads `config.json`, so edits to `streamers`, `keywords`, or `discord_webhook_url` take effect on the next run without restarting the script.
+- Already-processed VODs (tracked in `processed_vods`) are still skipped each cycle, so only new VODs get scanned.
+- The output file (`--output`, default `mentions.json`) is overwritten with just that cycle's findings each run — Discord notifications are the persistent record across cycles.
+- `--schedule` can't be combined with `--vod-id` (scanning one fixed VOD repeatedly doesn't make sense).
+- Stop the loop with Ctrl+C.
 
 ## CLI flags
 
@@ -127,6 +153,7 @@ python clip_scanner.py xqc --vods 10 --output results/xqc.json --threshold 75 --
 | `--output PATH` | `mentions.json` | Output JSON file path |
 | `--threshold 0-100` | from config | Fuzzy match score threshold |
 | `--keep-audio` | off | Keep downloaded MP3s in `./audio/` |
+| `--schedule [HOURS]` | off (single run) | Loop forever, rescanning every `HOURS` hours; defaults to `24` if the flag is passed with no value |
 
 **Choosing a Whisper model:**
 
@@ -177,3 +204,4 @@ Results are written as a JSON array. Each entry represents one product mention:
 - **Fuzzy matching** catches variations like "flickfire", "flick fiyah", or mumbled speech. Lower `--threshold` to catch more (at the cost of false positives).
 - **Deduplication:** Multiple hits for the same product within 5 seconds are collapsed into the highest-scoring match.
 - **Skipped VODs:** Subscriber-only or deleted VODs will be skipped with an error message; scanning continues for the rest.
+- **Current Streamer List:** vergofn_, Sommerset, venofn, Higgs, shxrkfnbr, acorn, fnpaper, GMoney, noahreyli, Crackly, bushszn

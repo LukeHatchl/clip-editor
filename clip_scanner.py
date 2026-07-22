@@ -85,6 +85,20 @@ def get_vod_by_id(token, vod_id):
     return data
 
 
+def get_live_stream(token, user_id):
+    resp = requests.get(
+        "https://api.twitch.tv/helix/streams",
+        headers={
+            "Client-Id": TWITCH_CLIENT_ID,
+            "Authorization": f"Bearer {token}",
+        },
+        params={"user_id": user_id},
+    )
+    resp.raise_for_status()
+    data = resp.json()["data"]
+    return data[0] if data else None
+
+
 def get_vods(token, user_id, limit):
     vods = []
     cursor = None
@@ -123,10 +137,11 @@ def download_audio(vod_id, output_dir):
             "--audio-format", "mp3",
             "--audio-quality", "5",
             "--no-playlist",
+            "--progress",
             "-o", str(output_path),
             url,
         ],
-        capture_output=True,
+        stderr=subprocess.PIPE,
         text=True,
     )
     if result.returncode != 0:
@@ -234,49 +249,7 @@ def post_discord_notification(webhook_url, streamer, vod_id, vod_title, mention,
         break
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Scan Twitch VODs for product mentions using Whisper + fuzzy matching."
-    )
-    parser.add_argument(
-        "username", nargs="?",
-        help="Twitch username to scan (omit to scan all streamers in config.json)",
-    )
-    parser.add_argument(
-        "--vods", type=int, default=5, metavar="N",
-        help="Number of recent VODs to scan per streamer (default: 5)",
-    )
-    parser.add_argument(
-        "--model",
-        default="base",
-        choices=["tiny", "base", "small", "medium", "large"],
-        help="Whisper model size (default: base)",
-    )
-    parser.add_argument(
-        "--output", default="mentions.json",
-        help="Output JSON file path (default: mentions.json)",
-    )
-    parser.add_argument(
-        "--threshold", type=int, default=None, metavar="0-100",
-        help="Fuzzy match threshold (default: fuzzy_threshold in config.json)",
-    )
-    parser.add_argument(
-        "--vod-id", metavar="VOD_ID",
-        help="Scan a specific VOD ID instead of fetching recent VODs",
-    )
-    parser.add_argument(
-        "--keep-audio", action="store_true",
-        help="Keep downloaded audio files in ./audio/",
-    )
-    args = parser.parse_args()
-
-    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
-        print(
-            "Error: TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET environment variables must be set.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
+def scan_once(args, token, whisper_model):
     config = load_config()
     keywords = config.get("keywords", [])
     threshold = args.threshold if args.threshold is not None else config.get("fuzzy_threshold", FUZZY_THRESHOLD)
@@ -297,13 +270,7 @@ def main():
                 "Error: no username given and no streamers configured in config.json.",
                 file=sys.stderr,
             )
-            sys.exit(1)
-
-    print("Authenticating with Twitch...")
-    token = get_twitch_token()
-
-    print(f"Loading Whisper model '{args.model}'...")
-    whisper_model = whisper.load_model(args.model)
+            return [], 0
 
     all_results = []
     total_vods_scanned = 0
@@ -320,8 +287,22 @@ def main():
             else:
                 print(f"\nLooking up Twitch user: {username}")
                 user_id = get_user_id(token, username)
+
+                live_stream = get_live_stream(token, user_id)
+                fetch_limit = args.vods + 1 if live_stream else args.vods
                 print(f"Fetching {args.vods} most recent VOD(s)...")
-                vods = get_vods(token, user_id, limit=args.vods)
+                vods = get_vods(token, user_id, limit=fetch_limit)
+
+                if live_stream and vods:
+                    started_at = live_stream["started_at"]
+                    in_progress = next(
+                        (v for v in vods if v["created_at"] == started_at), vods[0]
+                    )
+                    print(
+                        f"  {username} is currently live (since {started_at}); "
+                        f"skipping in-progress VOD {in_progress['id']}."
+                    )
+                    vods = [v for v in vods if v["id"] != in_progress["id"]][:args.vods]
 
             if not vods:
                 print(f"  No VODs found.")
@@ -402,6 +383,91 @@ def main():
 
     print(f"\nDone. {len(all_results)} mention(s) found across {total_vods_scanned} VOD(s).")
     print(f"Results saved to: {output_path}")
+
+    return all_results, total_vods_scanned
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Scan Twitch VODs for product mentions using Whisper + fuzzy matching."
+    )
+    parser.add_argument(
+        "username", nargs="?",
+        help="Twitch username to scan (omit to scan all streamers in config.json)",
+    )
+    parser.add_argument(
+        "--vods", type=int, default=5, metavar="N",
+        help="Number of recent VODs to scan per streamer (default: 5)",
+    )
+    parser.add_argument(
+        "--model",
+        default="base",
+        choices=["tiny", "base", "small", "medium", "large"],
+        help="Whisper model size (default: base)",
+    )
+    parser.add_argument(
+        "--output", default="mentions.json",
+        help="Output JSON file path (default: mentions.json)",
+    )
+    parser.add_argument(
+        "--threshold", type=int, default=None, metavar="0-100",
+        help="Fuzzy match threshold (default: fuzzy_threshold in config.json)",
+    )
+    parser.add_argument(
+        "--vod-id", metavar="VOD_ID",
+        help="Scan a specific VOD ID instead of fetching recent VODs",
+    )
+    parser.add_argument(
+        "--keep-audio", action="store_true",
+        help="Keep downloaded audio files in ./audio/",
+    )
+    parser.add_argument(
+        "--schedule", type=float, nargs="?", const=24.0, default=None, metavar="HOURS",
+        help="Run continuously, rescanning the configured streamers every HOURS hours "
+             "(default: 24). Pass a value like '--schedule 0.5' for 30 minutes.",
+    )
+    args = parser.parse_args()
+
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        print(
+            "Error: TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET environment variables must be set.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.schedule is not None and args.vod_id:
+        print("Error: --schedule cannot be combined with --vod-id.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.schedule is not None and args.schedule <= 0:
+        print("Error: --schedule must be a positive number of hours.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Authenticating with Twitch...")
+    token = get_twitch_token()
+
+    print(f"Loading Whisper model '{args.model}'...")
+    whisper_model = whisper.load_model(args.model)
+
+    if args.schedule is None:
+        scan_once(args, token, whisper_model)
+        return
+
+    interval_seconds = args.schedule * 3600
+    print(f"Schedule mode enabled: scanning every {args.schedule} hour(s). Press Ctrl+C to stop.")
+    try:
+        while True:
+            print(f"\n=== Scan started at {datetime.datetime.now().isoformat(timespec='seconds')} ===")
+            try:
+                token = get_twitch_token()
+            except Exception as exc:
+                print(f"Warning: failed to refresh Twitch token, reusing previous one: {exc}", file=sys.stderr)
+            scan_once(args, token, whisper_model)
+            next_run = datetime.datetime.now() + datetime.timedelta(seconds=interval_seconds)
+            print(f"Sleeping {args.schedule} hour(s) until next scan at {next_run.isoformat(timespec='seconds')}...")
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        print("\nSchedule stopped.")
 
 
 class _keep_audio_dir:
